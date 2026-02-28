@@ -1,4 +1,7 @@
-use core::ptr::NonNull;
+use core::{
+    ptr::NonNull,
+    sync::atomic::{Ordering, compiler_fence},
+};
 
 use log::{debug, info, trace};
 use volatile::VolatilePtr;
@@ -8,6 +11,77 @@ use crate::{
     regs::{ClkDiv, ClkEna, RegisterBlock, RegisterBlockVolatileFieldAccess},
     utils::{Cid, CsdV2},
 };
+
+const IDMAC_INT_TI: u32 = 1;
+const IDMAC_INT_RI: u32 = 1 << 1;
+const IDMAC_INT_FBE: u32 = 1 << 2;
+const IDMAC_INT_DU: u32 = 1 << 4;
+const IDMAC_INT_CES: u32 = 1 << 5;
+const IDMAC_INT_COMPLETE_MASK: u32 = IDMAC_INT_TI | IDMAC_INT_RI;
+const IDMAC_INT_ERROR_MASK: u32 = IDMAC_INT_FBE | IDMAC_INT_DU | IDMAC_INT_CES;
+
+#[repr(C, align(64))]
+struct IdmacDesc {
+    des0: u32,
+    des1: u32,
+    des2: u32,
+    des3: u32,
+}
+
+impl IdmacDesc {
+    const OWN: u32 = 1 << 31;
+    const FIRST: u32 = 1 << 3;
+    const LAST: u32 = 1 << 2;
+
+    const fn new() -> Self {
+        Self {
+            des0: 0,
+            des1: 0,
+            des2: 0,
+            des3: 0,
+        }
+    }
+
+    fn configure(&mut self, buffer: *const u8, len: usize) {
+        assert!(len > 0, "DMA transfer length must be non-zero");
+        assert!(
+            len <= 0x1fff,
+            "DMA transfer length exceeds descriptor capacity"
+        );
+        let addr = buffer as usize as u64;
+        assert!(
+            addr <= u32::MAX as u64,
+            "buffer is outside the 32-bit address space"
+        );
+
+        self.des0 = Self::OWN | Self::FIRST | Self::LAST;
+        self.des1 = len as u32;
+        self.des2 = addr as u32;
+        self.des3 = 0;
+    }
+
+    fn descriptor_address(&self) -> u32 {
+        let addr = self as *const _ as usize as u64;
+        assert!(addr <= u32::MAX as u64, "descriptor outside 32-bit range");
+        addr as u32
+    }
+}
+
+struct DmaState {
+    desc: IdmacDesc,
+    active: bool,
+    last_status: u32,
+}
+
+impl DmaState {
+    const fn new() -> Self {
+        Self {
+            desc: IdmacDesc::new(),
+            active: false,
+            last_status: 0,
+        }
+    }
+}
 
 fn wait_until<F>(mut f: F)
 where
@@ -23,6 +97,7 @@ where
 pub struct SdMmc {
     regs: VolatilePtr<'static, RegisterBlock>,
     num_blocks: u64,
+    dma: DmaState,
 }
 
 impl SdMmc {
@@ -40,6 +115,7 @@ impl SdMmc {
         let mut this = Self {
             regs,
             num_blocks: 0,
+            dma: DmaState::new(),
         };
         this.init();
         this
@@ -66,11 +142,59 @@ impl SdMmc {
         self.regs.bytcnt().write(byte_cnt);
     }
 
-    fn send_cmd(&self, command: Command<'_>) -> Option<[u32; 4]> {
+    fn prepare_dma_transfer(&mut self, buffer: *const u8, len: usize) {
+        debug_assert!(!self.dma.active, "DMA transfer already active");
+        self.dma.desc.configure(buffer, len);
+        self.dma.last_status = 0;
+        compiler_fence(Ordering::SeqCst);
+
+        self.regs.idsts().write(u32::MAX);
+        self.regs.idinten().write(0);
+
+        let desc_addr = self.dma.desc.descriptor_address();
+        self.regs.dbaddr().write(desc_addr);
+
+        self.regs
+            .ctrl()
+            .update(|r| r.with_use_internal_dmac(true).with_dma_enable(true));
+
+        self.regs
+            .bmod()
+            .update(|r| r.with_swr(false).with_fb(true).with_de(true));
+
+        self.regs.pldmnd().write(1);
+        self.dma.active = true;
+    }
+
+    fn wait_for_dma_completion(&mut self) -> bool {
+        debug_assert!(self.dma.active, "No DMA transfer pending");
+        wait_until(|| {
+            let status = self.regs.idsts().read();
+            self.dma.last_status = status;
+            status & (IDMAC_INT_COMPLETE_MASK | IDMAC_INT_ERROR_MASK) != 0
+        });
+
+        let status = self.dma.last_status;
+        self.regs.idsts().write(status);
+
+        wait_until(|| {
+            let rintsts = self.regs.rintsts().read();
+            rintsts.data_transfer_over() || rintsts.error()
+        });
+
+        self.regs.ctrl().update(|r| r.with_dma_enable(false));
+        self.dma.active = false;
+
+        (status & IDMAC_INT_ERROR_MASK) == 0
+    }
+
+    fn send_cmd(&mut self, command: Command<'_>) -> Option<[u32; 4]> {
         trace!("send_cmd {command:#x?}");
 
         let (cmd, arg, xfer) = command.build();
         assert_eq!(cmd.data_expected(), xfer.is_some());
+
+        let mut dma_failed = false;
 
         trace!("send_cmd {cmd:?} {arg:#x?}");
 
@@ -91,44 +215,53 @@ impl SdMmc {
         }
 
         if let Some(xfer) = xfer {
-            let fifo_base = unsafe { self.regs.as_raw_ptr().byte_add(Self::FIFO) }.cast::<u64>();
-            let mut offset = 0;
-            match xfer {
-                DataXfer::Read(buf) => {
-                    wait_until(|| {
-                        let rintsts = self.regs.rintsts().read();
-
-                        if rintsts.receive_fifo_data_request() {
-                            trace!("rxdr");
-                            while self.fifo_cnt() >= 2 {
-                                let data = unsafe { fifo_base.byte_add(offset).read_volatile() };
-                                buf[offset..offset + 8].copy_from_slice(&data.to_le_bytes());
-                                offset += 8;
-                            }
-                        }
-
-                        rintsts.data_transfer_over() || rintsts.error()
-                    });
-                    trace!("received {offset} bytes");
+            if self.dma.active {
+                if !self.wait_for_dma_completion() {
+                    dma_failed = true;
                 }
-                DataXfer::Write(buf) => {
-                    wait_until(|| {
-                        let rintsts = self.regs.rintsts().read();
+            } else {
+                let fifo_base =
+                    unsafe { self.regs.as_raw_ptr().byte_add(Self::FIFO) }.cast::<u64>();
+                let mut offset = 0;
+                match xfer {
+                    DataXfer::Read(buf) => {
+                        wait_until(|| {
+                            let rintsts = self.regs.rintsts().read();
 
-                        if rintsts.transmit_fifo_data_request() {
-                            trace!("txdr");
-                            // Hard coded FIFO depth
-                            while self.fifo_cnt() < 120 && offset < buf.len() {
-                                let data =
-                                    u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
-                                unsafe { fifo_base.byte_add(offset).write_volatile(data) };
-                                offset += 8;
+                            if rintsts.receive_fifo_data_request() {
+                                trace!("rxdr");
+                                while self.fifo_cnt() >= 2 {
+                                    let data =
+                                        unsafe { fifo_base.byte_add(offset).read_volatile() };
+                                    buf[offset..offset + 8].copy_from_slice(&data.to_le_bytes());
+                                    offset += 8;
+                                }
                             }
-                        }
 
-                        rintsts.data_transfer_over() || rintsts.error()
-                    });
-                    trace!("sent {offset} bytes");
+                            rintsts.data_transfer_over() || rintsts.error()
+                        });
+                        trace!("received {offset} bytes");
+                    }
+                    DataXfer::Write(buf) => {
+                        wait_until(|| {
+                            let rintsts = self.regs.rintsts().read();
+
+                            if rintsts.transmit_fifo_data_request() {
+                                trace!("txdr");
+                                // Hard coded FIFO depth
+                                while self.fifo_cnt() < 120 && offset < buf.len() {
+                                    let data = u64::from_le_bytes(
+                                        buf[offset..offset + 8].try_into().unwrap(),
+                                    );
+                                    unsafe { fifo_base.byte_add(offset).write_volatile(data) };
+                                    offset += 8;
+                                }
+                            }
+
+                            rintsts.data_transfer_over() || rintsts.error()
+                        });
+                        trace!("sent {offset} bytes");
+                    }
                 }
             }
         }
@@ -138,6 +271,15 @@ impl SdMmc {
         let rintsts = self.regs.rintsts().read();
         // clear interrupt status
         self.regs.rintsts().write(rintsts);
+
+        if dma_failed {
+            trace!(
+                "cmd {} DMA error: status {:#x}",
+                cmd.cmd_index(),
+                self.dma.last_status
+            );
+            return None;
+        }
 
         if rintsts.error() {
             trace!("cmd {} error: {rintsts:?} resp: {resp:?}", cmd.cmd_index());
@@ -183,11 +325,19 @@ impl SdMmc {
 
         // reset dma
         self.regs.bmod().update(|r| r.with_de(false).with_swr(true));
-        self.regs
-            .ctrl()
-            .update(|r| r.with_dma_reset(true).with_use_internal_dmac(false));
+        self.regs.ctrl().update(|r| {
+            r.with_dma_reset(true)
+                .with_use_internal_dmac(true)
+                .with_dma_enable(false)
+        });
 
         trace!("dma reset");
+
+        self.regs.idsts().write(u32::MAX);
+        self.regs.idinten().write(0);
+        self.regs
+            .bmod()
+            .update(|r| r.with_swr(false).with_fb(true).with_de(true));
 
         trace!("ctrl: {:?}", self.regs.ctrl().read());
 
@@ -260,6 +410,7 @@ impl SdMmc {
     /// Reads a single block from the SD/MMC card.
     pub fn read_block(&mut self, block: u32, buf: &mut [u8; 512]) {
         self.set_transaction_size(512, 512);
+        self.prepare_dma_transfer(buf.as_mut_ptr() as *const u8, buf.len());
         self.send_cmd(Command::ReadSingleBlock(block, buf)).unwrap();
         trace!("fifo count: {}", self.fifo_cnt());
     }
@@ -267,6 +418,7 @@ impl SdMmc {
     /// Writes a single block to the SD/MMC card.
     pub fn write_block(&mut self, block: u32, buf: &[u8; 512]) {
         self.set_transaction_size(512, 512);
+        self.prepare_dma_transfer(buf.as_ptr(), buf.len());
         self.send_cmd(Command::WriteSingleBlock(block, buf))
             .unwrap();
         trace!("fifo count: {}", self.fifo_cnt());

@@ -164,6 +164,22 @@ pub struct RegisterBlock {
     /// The LSB bits [0/1/2:0] for 16/32/64-bit bus-width) are ignored and taken
     /// as all-zero by the IDMAC internally. Hence these LSB bits are read-only.
     pub dbaddr: u32,
+
+    /// Internal DMA Status Register
+    ///
+    /// Writing a 1 to any bit clears the corresponding interrupt.
+    pub idsts: u32,
+
+    /// Internal DMA Interrupt Enable Register
+    pub idinten: u32,
+
+    /// Current Descriptor Address Register
+    #[access(ReadOnly)]
+    pub dscaddr: u32,
+
+    /// Current Buffer Address Register
+    #[access(ReadOnly)]
+    pub bufaddr: u32,
 }
 
 /// Control Register
