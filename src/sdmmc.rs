@@ -98,6 +98,7 @@ pub struct SdMmc {
     regs: VolatilePtr<'static, RegisterBlock>,
     num_blocks: u64,
     dma: DmaState,
+    dma_enabled: bool,
 }
 
 impl SdMmc {
@@ -116,6 +117,7 @@ impl SdMmc {
             regs,
             num_blocks: 0,
             dma: DmaState::new(),
+            dma_enabled: true,
         };
         this.init();
         this
@@ -194,6 +196,16 @@ impl SdMmc {
         let (cmd, arg, xfer) = command.build();
         assert_eq!(cmd.data_expected(), xfer.is_some());
 
+        if self.dma_enabled {
+            if let Some(xfer) = &xfer {
+                let (buffer, len) = match xfer {
+                    DataXfer::Read(buf) => (buf.as_ptr(), buf.len()),
+                    DataXfer::Write(buf) => (buf.as_ptr(), buf.len()),
+                };
+                self.prepare_dma_transfer(buffer, len);
+            }
+        }
+
         let mut dma_failed = false;
 
         trace!("send_cmd {cmd:?} {arg:#x?}");
@@ -215,7 +227,7 @@ impl SdMmc {
         }
 
         if let Some(xfer) = xfer {
-            if self.dma.active {
+            if self.dma_enabled {
                 if !self.wait_for_dma_completion() {
                     dma_failed = true;
                 }
@@ -230,7 +242,7 @@ impl SdMmc {
 
                             if rintsts.receive_fifo_data_request() {
                                 trace!("rxdr");
-                                while self.fifo_cnt() >= 2 {
+                                while self.fifo_cnt() >= 2 && offset < buf.len() {
                                     let data =
                                         unsafe { fifo_base.byte_add(offset).read_volatile() };
                                     buf[offset..offset + 8].copy_from_slice(&data.to_le_bytes());
@@ -286,6 +298,19 @@ impl SdMmc {
             return None;
         }
         Some(resp)
+    }
+
+    /// Enables or disables DMA transfers.
+    ///
+    /// DMA is enabled by default. Set `enabled` to `false` to force legacy
+    /// FIFO polling transfers.
+    pub fn set_dma_enabled(&mut self, enabled: bool) {
+        self.dma_enabled = enabled;
+    }
+
+    /// Returns whether DMA is currently enabled for data transfers.
+    pub fn dma_enabled(&self) -> bool {
+        self.dma_enabled
     }
 
     fn init(&mut self) {
@@ -385,17 +410,11 @@ impl SdMmc {
         self.send_cmd(Command::AppCmd(rca << 16)).unwrap();
 
         self.set_transaction_size(8, 8);
-        let mut buf = [0u8; 512];
-        self.send_cmd(Command::SendScr(&mut buf)).unwrap();
+        let mut scr = [0u8; 8];
+        self.send_cmd(Command::SendScr(&mut scr)).unwrap();
 
         trace!("fifo count: {}", self.fifo_cnt());
-        let resp = unsafe {
-            self.regs
-                .as_raw_ptr()
-                .byte_add(Self::FIFO)
-                .cast::<u64>()
-                .read_volatile()
-        };
+        let resp = u64::from_le_bytes(scr);
         debug!("Bus width supported: {:#x?}", (resp >> 8) & 0xf);
         trace!("fifo count: {}", self.fifo_cnt());
 
@@ -410,7 +429,6 @@ impl SdMmc {
     /// Reads a single block from the SD/MMC card.
     pub fn read_block(&mut self, block: u32, buf: &mut [u8; 512]) {
         self.set_transaction_size(512, 512);
-        self.prepare_dma_transfer(buf.as_mut_ptr() as *const u8, buf.len());
         self.send_cmd(Command::ReadSingleBlock(block, buf)).unwrap();
         trace!("fifo count: {}", self.fifo_cnt());
     }
@@ -418,7 +436,6 @@ impl SdMmc {
     /// Writes a single block to the SD/MMC card.
     pub fn write_block(&mut self, block: u32, buf: &[u8; 512]) {
         self.set_transaction_size(512, 512);
-        self.prepare_dma_transfer(buf.as_ptr(), buf.len());
         self.send_cmd(Command::WriteSingleBlock(block, buf))
             .unwrap();
         trace!("fifo count: {}", self.fifo_cnt());
