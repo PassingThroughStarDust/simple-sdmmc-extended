@@ -165,21 +165,14 @@ pub struct RegisterBlock {
     /// as all-zero by the IDMAC internally. Hence these LSB bits are read-only.
     pub dbaddr: u32,
 
-    /// Internal DMA Status Register
-    ///
-    /// Writing a 1 to any bit clears the corresponding interrupt.
-    pub idsts: u32,
-
-    /// Internal DMA Interrupt Enable Register
-    pub idinten: u32,
-
-    /// Current Descriptor Address Register
+    /// IDMAC Status Register
+    /// 
+    /// Contains the current status of the IDMAC. This is a read-only register.
     #[access(ReadOnly)]
-    pub dscaddr: u32,
+    pub idsts: IdSts,
 
-    /// Current Buffer Address Register
-    #[access(ReadOnly)]
-    pub bufaddr: u32,
+    /// IDMAC Interrupt Enable Register
+    pub idinten: IdIntEn,
 }
 
 /// Control Register
@@ -1260,6 +1253,129 @@ pub struct BMod {
     ///
     /// SWR is read/write. It is automatically cleared after 1 clock cycle.
     pub swr: bool,
+}
+
+#[bitfield(u32, order = Msb)]
+pub struct IdSts {
+    #[bits(15)]
+    __: u32,
+
+    /// DMAC FSM present state.
+    ///     0 – DMA_IDLE
+    ///     1 – DMA_SUSPEND
+    ///     2 – DESC_RD
+    ///     3 – DESC_CHK
+    ///     4 – DMA_RD_REQ_WAIT
+    ///     5 – DMA_WR_REQ_WAIT
+    ///     6 – DMA_RD
+    ///     7 – DMA_WR
+    ///     8 – DESC_CLOSE
+    /// This bit is read-only.
+    #[bits(4)]
+    pub fsm: u8,
+
+    /// Error Bits. Indicates the type of error that caused a Bus Error. Valid only with Fatal Bus
+    /// Error bit (IDSTS[2]) set. This field does not generate an interrupt.
+    ///     3’b001 – Host Abort received during transmission
+    ///     3’b010 – Host Abort received during reception
+    /// Others: Reserved
+    /// EB is read-only.
+    #[bits(3)]
+    pub ebe: u8,
+
+    /// Abnormal Interrupt Summary. Logical OR of the following:
+    ///     IDSTS[2] – Fatal Bus Interrupt
+    ///     IDSTS[4] – DU bit Interrupt
+    ///     IDSTS[5] – Card Error Summary Interrupt
+    /// Only unmasked bits affect this bit.
+    /// This is a sticky bit and must be cleared each time a corresponding bit that causes AIS
+    /// to be set is cleared. Writing a 1 clears this bit.
+    pub ais: bool,
+
+    /// Normal Interrupt Summary. Logical OR of the following:
+    ///     IDSTS[0] – Transmit Interrupt
+    ///     IDSTS[1] – Receive Interrupt
+    /// Only unmasked bits affect this bit.
+    /// This is a sticky bit and must be cleared each time a corresponding bit that causes NIS
+    /// to be set is cleared. Writing a 1 clears this bit.
+    pub nis: bool,
+
+    #[bits(2)]
+    __: u8,
+
+    /// Card Error Summary. Indicates the status of the transaction to/from the card; also
+    /// present in RINTSTS. Indicates the logical OR of the following bits:
+    ///     EBE – End Bit Error
+    ///     RTO – Response Timeout/Boot Ack Timeout
+    ///     RCRC – Response CRC
+    ///     SBE – Start Bit Error
+    ///     DRTO – Data Read Timeout/BDS timeout
+    ///     DCRC – Data CRC for Receive
+    ///     RE – Response Error
+    /// Writing a 1 clears this bit.
+    pub ces: bool,
+
+    /// Descriptor Unavailable Interrupt. This bit is set when the descriptor is unavailable due
+    /// to OWN bit = 0 (DES0[31] =0). Writing a 1 clears this bit.
+    pub du: bool,
+
+    __: bool,
+
+    /// Fatal Bus Error Interrupt. Indicates that a Bus Error occurred (IDSTS[12:10]). When
+    /// this bit is set, the DMA disables all its bus accesses. Writing a 1 clears this bit.
+    pub fbe: bool,
+
+    /// Receive Interrupt. Indicates the completion of data reception for a descriptor. Writing a
+    /// 1 clears this bit.
+    pub ri: bool,
+
+    /// Transmit Interrupt. Indicates that data transmission is finished for a descriptor. Writing
+    /// a ‘1’ clears this bit.
+    pub ti: bool,
+}
+
+#[bitfield(u32, order = Msb)]
+pub struct IdIntEn {
+    #[bits(22)]
+    __: u32,
+
+    /// Abnormal Interrupt Summary Enable. When set, an abnormal interrupt is enabled.
+    /// This bit enables the following bits:
+    ///     IDINTEN[2] – Fatal Bus Error Interrupt
+    ///     IDINTEN[4] – DU Interrupt
+    ///     IDINTEN[5] – Card Error Summary Interrupt
+    pub ai: bool,
+
+    /// Normal Interrupt Summary Enable. When set, a normal interrupt is enabled. When
+    /// reset, a normal interrupt is disabled. This bit enables the following bits:
+    ///     IDINTEN[0] – Transmit Interrupt
+    ///     IDINTEN[1] – Receive Interrupt
+    pub ni: bool,
+
+    #[bits(2)]
+    __: u8,
+
+    /// Card Error summary Interrupt Enable. When set, it enables the Card Interrupt summary.
+    pub ces: bool,
+
+    /// Descriptor Unavailable Interrupt. When set along with Abnormal Interrupt Summary Enable, 
+    /// the DU interrupt is enabled.
+    pub du: bool,
+
+    __: bool,
+
+    /// Fatal Bus Error Enable. When set with Abnormal Interrupt Summary Enable, the
+    /// Fatal Bus Error Interrupt is enabled. When reset, Fatal Bus Error Enable Interrupt is
+    /// disabled.
+    pub fbe: bool,
+
+    /// Receive Interrupt Enable. When set with Normal Interrupt Summary Enable,
+    /// Receive Interrupt is enabled. When reset, Receive Interrupt is disabled.
+    pub ri: bool,
+
+    /// Transmit Interrupt Enable. When set with Normal Interrupt Summary Enable,
+    /// Transmit Interrupt is enabled. When reset, Transmit Interrupt is disabled.
+    pub ti: bool,
 }
 
 // TODO: there are more registers

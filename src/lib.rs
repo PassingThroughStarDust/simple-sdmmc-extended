@@ -6,5 +6,6 @@ mod cmd;
 mod regs;
 mod sdmmc;
 mod utils;
+mod dma;
 
 pub use self::sdmmc::SdMmc;

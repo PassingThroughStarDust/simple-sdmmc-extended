@@ -3,19 +3,19 @@ use core::fmt;
 use crate::regs::Cmd;
 
 pub enum Command<'a> {
-    GoIdleState,
-    AllSendCid,
-    SendRelativeAddr,
-    SelectCard(u32),
-    SendIfCond(u32),
-    SendCsd(u32),
-    ReadSingleBlock(u32, &'a mut [u8]),
-    WriteSingleBlock(u32, &'a [u8]),
-    SdSendOpCond(u32),
-    SendScr(&'a mut [u8]),
-    AppCmd(u32),
+    GoIdleState,                // CMD0
+    AllSendCid,                 // CMD2
+    SendRelativeAddr,           // CMD3
+    SelectCard(u32),            // CMD7
+    SendIfCond(u32),            // CMD8
+    SendCsd(u32),               // CMD9
+    ReadSingleBlock(u32, &'a mut [u8]),   // CMD17
+    WriteSingleBlock(u32, &'a [u8]),      // CMD24
+    SdSendOpCond(u32),          // ACMD41
+    SendScr(&'a mut [u8]),      // ACMD51
+    AppCmd(u32),                // CMD55
     /// Psuedo-command to reset the clock
-    ResetClock,
+    ResetClock,                 // Not a real command
 }
 
 impl fmt::Debug for Command<'_> {
@@ -95,7 +95,9 @@ impl<'a> Command<'a> {
             ),
 
             Command::ResetClock => (
-                Cmd::default().with_update_clock_registers_only(true),
+                Cmd::default()
+                    .with_update_clock_registers_only(true)
+                    .with_response_expect(false),  // Critical: no response expected for clock update only
                 0,
                 None,
             ),
